@@ -314,6 +314,14 @@ class KiroAuthManager:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
+            # IMPORTANT: Clear all credential fields first to avoid stale data
+            # This ensures that if a field is missing in the new file,
+            # we don't use old values from a previously loaded file
+            self._client_id = None
+            self._client_secret = None
+            self._client_id_hash = None
+            self._profile_arn = None
+            
             # Load common data from file
             if 'refreshToken' in data:
                 self._refresh_token = data['refreshToken']
@@ -412,26 +420,178 @@ class KiroAuthManager:
         
         Routes to appropriate refresh method based on auth type:
         - KIRO_DESKTOP: Uses Kiro Desktop Auth endpoint
-        - AWS_SSO_OIDC: Uses AWS SSO OIDC endpoint
-        - KIRO_IDE_IDC: Reloads from file (Kiro IDE manages refresh)
+        - AWS_SSO_OIDC: Uses AWS SSO OIDC endpoint (JSON body with camelCase)
+        - KIRO_IDE_IDC: Uses AWS SSO OIDC via device registration (auto-refresh)
         
         Raises:
             ValueError: If refresh token is not set or response doesn't contain accessToken
             httpx.HTTPError: On HTTP request error
         """
         if self._auth_type == AuthType.KIRO_IDE_IDC:
-            await self._refresh_token_from_file()
+            await self._refresh_token_kiro_ide_idc()
         elif self._auth_type == AuthType.AWS_SSO_OIDC:
             await self._refresh_token_aws_sso_oidc()
         else:
             await self._refresh_token_kiro_desktop()
     
+    def _load_device_registration(self) -> tuple:
+        """
+        Loads clientId and clientSecret from device registration file.
+        
+        The device registration file is referenced by clientIdHash in the token file.
+        Location: ~/.aws/sso/cache/{clientIdHash}.json
+        
+        Returns:
+            Tuple of (clientId, clientSecret) or (None, None) if not found
+        """
+        if not self._client_id_hash:
+            return None, None
+        
+        # Device registration file is in the same directory as token file
+        if self._creds_file:
+            creds_path = Path(self._creds_file).expanduser()
+            registration_path = creds_path.parent / f"{self._client_id_hash}.json"
+        else:
+            registration_path = Path.home() / ".aws" / "sso" / "cache" / f"{self._client_id_hash}.json"
+        
+        if not registration_path.exists():
+            logger.warning(f"Device registration file not found: {registration_path}")
+            return None, None
+        
+        try:
+            with open(registration_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            client_id = data.get("clientId")
+            client_secret = data.get("clientSecret")
+            
+            if client_id and client_secret:
+                logger.debug(f"Loaded device registration from {registration_path}")
+                return client_id, client_secret
+            else:
+                logger.warning(f"Device registration file missing clientId or clientSecret")
+                return None, None
+                
+        except Exception as e:
+            logger.error(f"Error loading device registration: {e}")
+            return None, None
+    
+    async def _refresh_token_kiro_ide_idc(self) -> None:
+        """
+        Refreshes token for Kiro IDE IdC (Identity Center) authentication.
+        
+        This method:
+        1. Loads clientId/clientSecret from device registration file (via clientIdHash)
+        2. Uses AWS SSO OIDC endpoint with JSON body (camelCase) to refresh token
+        3. Updates the token file
+        
+        Raises:
+            ValueError: If required credentials are not available
+            httpx.HTTPError: On HTTP request error
+        """
+        if not self._refresh_token:
+            raise ValueError("Refresh token is not set")
+        
+        # Load clientId/clientSecret from device registration file
+        client_id, client_secret = self._load_device_registration()
+        
+        if not client_id or not client_secret:
+            # Fall back to file reload if device registration not found
+            logger.warning("Device registration not found, falling back to file reload")
+            await self._refresh_token_from_file()
+            return
+        
+        logger.info("Refreshing Kiro token via AWS SSO OIDC (IdC)...")
+        
+        # Use SSO region for OIDC endpoint
+        sso_region = self._sso_region or self._region
+        url = get_aws_sso_oidc_url(sso_region)
+        
+        # IMPORTANT: AWS SSO OIDC requires JSON body with camelCase field names
+        json_data = {
+            "grantType": "refresh_token",
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "refreshToken": self._refresh_token,
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+        }
+        
+        logger.debug(f"AWS SSO OIDC (IdC) refresh request: url={url}, region={sso_region}")
+        
+        async with httpx.AsyncClient(timeout=30, verify=False) as client:
+            response = await client.post(url, json=json_data, headers=headers)
+            
+            if response.status_code != 200:
+                error_body = response.text
+                logger.error(f"AWS SSO OIDC (IdC) refresh failed: status={response.status_code}, body={error_body}")
+                response.raise_for_status()
+            
+            result = response.json()
+        
+        new_access_token = result.get("accessToken")
+        new_refresh_token = result.get("refreshToken")
+        expires_in = result.get("expiresIn", 3600)
+        
+        if not new_access_token:
+            raise ValueError(f"AWS SSO OIDC response does not contain accessToken: {result}")
+        
+        # Update credentials
+        self._access_token = new_access_token
+        if new_refresh_token:
+            self._refresh_token = new_refresh_token
+        
+        # Calculate expiration time with buffer (minus 60 seconds)
+        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+        
+        logger.info(f"Token refreshed via AWS SSO OIDC (IdC), expires: {self._expires_at.isoformat()}")
+        
+        # Save updated token to file
+        self._save_kiro_ide_idc_token()
+    
+    def _save_kiro_ide_idc_token(self) -> None:
+        """
+        Saves updated IdC token back to the credentials file.
+        
+        Preserves other fields like clientIdHash, authMethod, provider, etc.
+        """
+        if not self._creds_file:
+            return
+        
+        try:
+            path = Path(self._creds_file).expanduser()
+            
+            # Read existing data to preserve other fields
+            existing_data = {}
+            if path.exists():
+                with open(path, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            
+            # Update token fields
+            existing_data['accessToken'] = self._access_token
+            existing_data['refreshToken'] = self._refresh_token
+            if self._expires_at:
+                existing_data['expiresAt'] = self._expires_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            
+            # Save
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            
+            # Update file mtime
+            self._file_mtime = path.stat().st_mtime
+            
+            logger.debug(f"IdC token saved to {self._creds_file}")
+            
+        except Exception as e:
+            logger.error(f"Error saving IdC token: {e}")
+    
     async def _refresh_token_from_file(self) -> None:
         """
         Refreshes token by reloading from credentials file.
         
-        Used for Kiro IDE IdC authentication where tokens cannot be refreshed
-        programmatically. Kiro IDE manages token refresh and updates the file.
+        Fallback method when programmatic refresh is not possible.
         
         Raises:
             ValueError: If credentials file is not set or token not found
@@ -439,17 +599,11 @@ class KiroAuthManager:
         if not self._creds_file:
             raise ValueError("Credentials file path is not set")
         
-        logger.info("Reloading Kiro token from file (IdC auth - Kiro IDE manages refresh)...")
+        logger.info("Reloading Kiro token from file...")
         
         path = Path(self._creds_file).expanduser()
         if not path.exists():
             raise ValueError(f"Credentials file not found: {self._creds_file}")
-        
-        # Check if file has been updated
-        current_mtime = path.stat().st_mtime
-        if current_mtime == self._file_mtime:
-            logger.warning("Credentials file has not been updated. Please ensure Kiro IDE is running.")
-            # Still reload to get latest token even if mtime unchanged
         
         # Reload credentials
         self._load_credentials_from_file(self._creds_file)
@@ -557,6 +711,9 @@ class KiroAuthManager:
         This is the internal implementation called by _refresh_token_aws_sso_oidc().
         It performs a single refresh attempt with current in-memory credentials.
         
+        IMPORTANT: AWS SSO OIDC requires JSON body with camelCase field names,
+        NOT form-urlencoded data with snake_case as documented in OAuth 2.0 spec.
+        
         Raises:
             ValueError: If required credentials are not set
             httpx.HTTPStatusError: On HTTP error (including 400 for invalid token)
@@ -570,21 +727,21 @@ class KiroAuthManager:
         
         logger.info("Refreshing Kiro token via AWS SSO OIDC...")
         
-        # AWS SSO OIDC uses form-urlencoded data
         # Use SSO region for OIDC endpoint (may differ from API region)
         sso_region = self._sso_region or self._region
         url = get_aws_sso_oidc_url(sso_region)
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-            "refresh_token": self._refresh_token,
+        
+        # IMPORTANT: AWS SSO OIDC requires JSON body with camelCase field names
+        # This is different from standard OAuth 2.0 which uses form-urlencoded
+        json_data = {
+            "grantType": "refresh_token",
+            "clientId": self._client_id,
+            "clientSecret": self._client_secret,
+            "refreshToken": self._refresh_token,
         }
         
-        # Note: scope parameter is NOT sent during refresh per OAuth 2.0 RFC 6749 Section 6
-        # AWS SSO OIDC uses the originally granted scopes automatically
         headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": "application/json",
         }
         
         # Log request details (without secrets) for debugging
@@ -592,7 +749,7 @@ class KiroAuthManager:
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(url, data=data, headers=headers)
+            response = await client.post(url, json=json_data, headers=headers)
             
             # Log response details for debugging (especially on errors)
             if response.status_code != 200:
