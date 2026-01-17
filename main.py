@@ -76,6 +76,9 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 
+# Login module for authentication
+from kiro.login import auth_router, scheduler
+
 
 # --- Loguru Configuration ---
 logger.remove()
@@ -220,25 +223,23 @@ def validate_configuration() -> None:
                 logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
         
         if not has_refresh_token and not has_creds_file and not has_cli_db:
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "   Configure one of the following in your .env file:\n"
-                "\n"
-                "Set you super-secret password as PROXY_API_KEY\n"
-                "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
-                "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
-                "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
-                "\n"
-                "   Option 2: Refresh token\n"
-                "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
-                "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
-                "\n"
-                "   See README.md for how to obtain credentials."
-            )
+            # Check for auto-generated credentials file
+            auto_creds_path = Path.home() / ".aws" / "sso" / "cache" / "kiro-gateway-auth.json"
+            if auto_creds_path.exists():
+                logger.info(f"Using auto-generated credentials from: {auto_creds_path}")
+            else:
+                logger.warning(
+                    "No Kiro credentials configured!\n"
+                    "\n"
+                    "   You can login via the API:\n"
+                    "   - POST /api/auth/social/start (Google/GitHub login)\n"
+                    "   - POST /api/auth/device-flow/start (AWS SSO login)\n"
+                    "\n"
+                    "   Or configure one of the following in your .env file:\n"
+                    "   - KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
+                    "   - REFRESH_TOKEN=\"your_refresh_token_here\"\n"
+                    "   - KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+                )
     
     # Print errors and exit if any
     if errors:
@@ -307,22 +308,73 @@ async def lifespan(app: FastAPI):
     logger.info("Shared HTTP client created with connection pooling")
     
     # Create AuthManager
-    # Priority: SQLite DB > JSON file > environment variables
+    # Priority: SQLite DB > JSON file > auto-scan > environment variables
+    auto_creds_path = Path.home() / ".aws" / "sso" / "cache" / "kiro-gateway-auth.json"
+    creds_file = KIRO_CREDS_FILE if KIRO_CREDS_FILE else None
+    
+    # Auto-scan for existing tokens if no credentials configured
+    if not creds_file and not REFRESH_TOKEN and not KIRO_CLI_DB_FILE:
+        # First check our own credentials file
+        if auto_creds_path.exists():
+            creds_file = str(auto_creds_path)
+            logger.info(f"Using saved credentials: {creds_file}")
+        else:
+            # Auto-scan ~/.aws/sso/cache/ for any valid token files
+            sso_cache = Path.home() / ".aws" / "sso" / "cache"
+            if sso_cache.exists():
+                import json as json_module
+                found_tokens = []
+                for f in sso_cache.glob("*.json"):
+                    try:
+                        with open(f) as fp:
+                            data = json_module.load(fp)
+                            if "accessToken" in data or "refreshToken" in data:
+                                mtime = f.stat().st_mtime
+                                found_tokens.append({"path": str(f), "data": data, "mtime": mtime})
+                    except Exception:
+                        pass
+                
+                if found_tokens:
+                    # Use the most recently modified token
+                    found_tokens.sort(key=lambda x: x["mtime"], reverse=True)
+                    best_token = found_tokens[0]
+                    
+                    # Copy to our credentials file
+                    auto_creds_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(auto_creds_path, "w") as fp:
+                        json_module.dump(best_token["data"], fp, indent=2)
+                    
+                    creds_file = str(auto_creds_path)
+                    logger.info(f"Auto-loaded token from: {best_token['path']}")
+                    logger.info(f"Saved to: {creds_file}")
+    
     app.state.auth_manager = KiroAuthManager(
         refresh_token=REFRESH_TOKEN,
         profile_arn=PROFILE_ARN,
         region=REGION,
-        creds_file=KIRO_CREDS_FILE if KIRO_CREDS_FILE else None,
+        creds_file=creds_file,
         sqlite_db=KIRO_CLI_DB_FILE if KIRO_CLI_DB_FILE else None,
     )
     
     # Create model cache
     app.state.model_cache = ModelInfoCache()
     
+    # Start background scheduler for token refresh
+    scheduler.set_auth_manager(app.state.auth_manager)
+    await scheduler.start()
+    logger.info("Background token refresh scheduler started")
+    
     yield
     
     # Graceful shutdown
     logger.info("Shutting down application...")
+    
+    # Stop background scheduler
+    try:
+        await scheduler.stop()
+    except Exception as e:
+        logger.warning(f"Error stopping scheduler: {e}")
+    
     try:
         await app.state.http_client.aclose()
         logger.info("Shared HTTP client closed")
@@ -362,6 +414,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Authentication API: /api/auth/*
+app.include_router(auth_router)
 
 
 # --- Uvicorn log config ---
@@ -509,6 +564,7 @@ def print_startup_banner(host: str, port: int) -> None:
     print()
     print(f"  {DIM}API Docs:      {url}/docs{RESET}")
     print(f"  {DIM}Health Check:  {url}/health{RESET}")
+    print(f"  {DIM}Login API:     {url}/api/auth/docs{RESET}")
     print()
 
 

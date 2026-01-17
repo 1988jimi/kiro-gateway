@@ -52,6 +52,9 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
     
+    Note: "thinking" type blocks are intentionally ignored as they are
+    returned by our proxy but not accepted by Anthropic API in requests.
+    
     Args:
         content: Anthropic message content
     
@@ -65,10 +68,19 @@ def convert_anthropic_content_to_text(content: Any) -> str:
         text_parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                block_type = block.get("type")
+                # Only extract text blocks, skip thinking/tool_use/tool_result/image
+                if block_type == "text":
                     text_parts.append(block.get("text", ""))
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
+                # Skip "thinking" blocks - they are from our proxy responses
+                # but Anthropic API doesn't accept them in requests
+                elif block_type == "thinking":
+                    logger.debug("Skipping 'thinking' block in message content")
+            elif hasattr(block, "type"):
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "thinking":
+                    logger.debug("Skipping 'thinking' block in message content")
         return "".join(text_parts)
     
     return str(content) if content else ""

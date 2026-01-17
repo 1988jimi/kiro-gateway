@@ -108,7 +108,10 @@ class ImageContentBlock(BaseModel):
 
 
 # Union type for all content blocks
-ContentBlock = Union[TextContentBlock, ToolUseContentBlock, ToolResultContentBlock, ImageContentBlock]
+# Note: ThinkingContentBlock is included to accept messages from Claude Code
+# that contain thinking blocks from previous responses. These will be
+# filtered out during conversion to Kiro format.
+ContentBlock = Union[TextContentBlock, ThinkingContentBlock, ToolUseContentBlock, ToolResultContentBlock, ImageContentBlock]
 
 
 # ==================================================================================================

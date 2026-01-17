@@ -60,9 +60,15 @@ class AuthType(Enum):
         - Uses https://oidc.{region}.amazonaws.com/token
         - Form body: grant_type=refresh_token&client_id=...&client_secret=...&refresh_token=...
         - Requires clientId and clientSecret from credentials file
+    
+    KIRO_IDE_IDC: Kiro IDE with AWS Identity Center (Enterprise SSO)
+        - Token file has clientIdHash but no inline clientId/clientSecret
+        - Cannot be refreshed programmatically - Kiro IDE manages refresh
+        - Gateway monitors file for changes and reloads automatically
     """
     KIRO_DESKTOP = "kiro_desktop"
     AWS_SSO_OIDC = "aws_sso_oidc"
+    KIRO_IDE_IDC = "kiro_ide_idc"
 
 
 class KiroAuthManager:
@@ -134,6 +140,10 @@ class KiroAuthManager:
         self._scopes: Optional[list] = None  # OAuth scopes for AWS SSO OIDC
         self._sso_region: Optional[str] = None  # SSO region for OIDC token refresh (may differ from API region)
         
+        # Kiro IDE IdC specific fields
+        self._client_id_hash: Optional[str] = None  # Reference to device registration file
+        self._file_mtime: float = 0  # Last modification time of credentials file
+        
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
@@ -163,10 +173,19 @@ class KiroAuthManager:
         """
         Detects authentication type based on available credentials.
         
-        AWS SSO OIDC credentials contain clientId and clientSecret.
-        Kiro Desktop credentials do not contain these fields.
+        Priority:
+        1. KIRO_IDE_IDC: Has clientIdHash but no inline clientId/clientSecret
+           - Kiro IDE with Identity Center (Enterprise SSO)
+           - Cannot be refreshed programmatically
+        2. AWS_SSO_OIDC: Has both clientId and clientSecret
+           - kiro-cli with AWS SSO
+        3. KIRO_DESKTOP: Default (social auth like Google/GitHub)
         """
-        if self._client_id and self._client_secret:
+        # Check for Kiro IDE IdC first (has clientIdHash but no inline credentials)
+        if self._client_id_hash and not (self._client_id and self._client_secret):
+            self._auth_type = AuthType.KIRO_IDE_IDC
+            logger.info("Detected auth type: Kiro IDE IdC (Enterprise SSO) - file-based refresh")
+        elif self._client_id and self._client_secret:
             self._auth_type = AuthType.AWS_SSO_OIDC
             logger.info("Detected auth type: AWS SSO OIDC (kiro-cli)")
         else:
@@ -276,6 +295,10 @@ class KiroAuthManager:
         - clientId: OAuth client ID
         - clientSecret: OAuth client secret
         
+        Additional fields for Kiro IDE IdC:
+        - clientIdHash: Reference to device registration file
+        - authMethod: "IdC" for Identity Center
+        
         Args:
             file_path: Path to JSON file
         """
@@ -284,6 +307,9 @@ class KiroAuthManager:
             if not path.exists():
                 logger.warning(f"Credentials file not found: {file_path}")
                 return
+            
+            # Record file modification time for change detection
+            self._file_mtime = path.stat().st_mtime
             
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -307,6 +333,10 @@ class KiroAuthManager:
                 self._client_id = data['clientId']
             if 'clientSecret' in data:
                 self._client_secret = data['clientSecret']
+            
+            # Load Kiro IDE IdC specific fields
+            if 'clientIdHash' in data:
+                self._client_id_hash = data['clientIdHash']
             
             # Parse expiresAt
             if 'expiresAt' in data:
@@ -383,15 +413,52 @@ class KiroAuthManager:
         Routes to appropriate refresh method based on auth type:
         - KIRO_DESKTOP: Uses Kiro Desktop Auth endpoint
         - AWS_SSO_OIDC: Uses AWS SSO OIDC endpoint
+        - KIRO_IDE_IDC: Reloads from file (Kiro IDE manages refresh)
         
         Raises:
             ValueError: If refresh token is not set or response doesn't contain accessToken
             httpx.HTTPError: On HTTP request error
         """
-        if self._auth_type == AuthType.AWS_SSO_OIDC:
+        if self._auth_type == AuthType.KIRO_IDE_IDC:
+            await self._refresh_token_from_file()
+        elif self._auth_type == AuthType.AWS_SSO_OIDC:
             await self._refresh_token_aws_sso_oidc()
         else:
             await self._refresh_token_kiro_desktop()
+    
+    async def _refresh_token_from_file(self) -> None:
+        """
+        Refreshes token by reloading from credentials file.
+        
+        Used for Kiro IDE IdC authentication where tokens cannot be refreshed
+        programmatically. Kiro IDE manages token refresh and updates the file.
+        
+        Raises:
+            ValueError: If credentials file is not set or token not found
+        """
+        if not self._creds_file:
+            raise ValueError("Credentials file path is not set")
+        
+        logger.info("Reloading Kiro token from file (IdC auth - Kiro IDE manages refresh)...")
+        
+        path = Path(self._creds_file).expanduser()
+        if not path.exists():
+            raise ValueError(f"Credentials file not found: {self._creds_file}")
+        
+        # Check if file has been updated
+        current_mtime = path.stat().st_mtime
+        if current_mtime == self._file_mtime:
+            logger.warning("Credentials file has not been updated. Please ensure Kiro IDE is running.")
+            # Still reload to get latest token even if mtime unchanged
+        
+        # Reload credentials
+        self._load_credentials_from_file(self._creds_file)
+        self._detect_auth_type()
+        
+        if not self._access_token:
+            raise ValueError("No access token found in credentials file")
+        
+        logger.info(f"Token reloaded from file, expires: {self._expires_at.isoformat() if self._expires_at else 'unknown'}")
     
     async def _refresh_token_kiro_desktop(self) -> None:
         """
@@ -627,5 +694,49 @@ class KiroAuthManager:
     
     @property
     def auth_type(self) -> AuthType:
-        """Authentication type (KIRO_DESKTOP or AWS_SSO_OIDC)."""
+        """Authentication type (KIRO_DESKTOP, AWS_SSO_OIDC, or KIRO_IDE_IDC)."""
         return self._auth_type
+    
+    @property
+    def creds_file(self) -> Optional[str]:
+        """Credentials file path."""
+        return self._creds_file
+    
+    @property
+    def file_mtime(self) -> float:
+        """Last known modification time of credentials file."""
+        return self._file_mtime
+    
+    def check_file_updated(self) -> bool:
+        """
+        Check if credentials file has been updated since last load.
+        
+        Returns:
+            True if file has been modified, False otherwise
+        """
+        if not self._creds_file:
+            return False
+        
+        try:
+            path = Path(self._creds_file).expanduser()
+            if not path.exists():
+                return False
+            
+            current_mtime = path.stat().st_mtime
+            return current_mtime != self._file_mtime
+        except Exception:
+            return False
+    
+    async def reload_from_file(self) -> None:
+        """
+        Reload credentials from file if it has been updated.
+        
+        Thread-safe method that reloads credentials and re-detects auth type.
+        """
+        async with self._lock:
+            if not self._creds_file:
+                return
+            
+            logger.info("Reloading credentials from file...")
+            self._load_credentials_from_file(self._creds_file)
+            self._detect_auth_type()

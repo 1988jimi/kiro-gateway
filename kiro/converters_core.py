@@ -975,7 +975,9 @@ def build_kiro_payload(
         user_input_context["tools"] = kiro_tools
     
     # Process images in current message - convert to Kiro format
+    # NOTE: Images go directly in user_input_message, NOT in userInputMessageContext
     images = current_message.images or extract_images_from_content(current_message.content)
+    kiro_images = None
     if images:
         kiro_images = []
         for img in images:
@@ -986,8 +988,7 @@ def build_kiro_payload(
                 }
             })
         if kiro_images:
-            user_input_context["images"] = kiro_images
-            logger.debug(f"Added {len(kiro_images)} images to current message")
+            logger.debug(f"Prepared {len(kiro_images)} images for current message")
     
     # Process tool_results in current message
     tool_results = current_message.tool_results or extract_tool_results_from_content(current_message.content)
@@ -1006,6 +1007,11 @@ def build_kiro_payload(
         "modelId": model_id,
         "origin": "AI_EDITOR",
     }
+    
+    # Add images directly to user_input_message (NOT in userInputMessageContext)
+    if kiro_images:
+        user_input_message["images"] = kiro_images
+        logger.info(f"Added {len(kiro_images)} images to userInputMessage")
     
     # Add user_input_context if present
     if user_input_context:
